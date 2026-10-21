@@ -1,0 +1,76 @@
+# ADR-004: Centralized Ingress Authentication and Internal Identity Propagation
+
+## Status
+**Accepted**
+
+---
+
+## Context
+ShopFlow is an e-commerce platform composed of an API Gateway, multiple internal microservices, and a React frontend. The platform requires a secure, low-latency authentication and authorization architecture that supports:
+1. Secure credential storage and token issuance.
+2. Fast client authentication without burdening internal microservices with repetitive cryptographic verification.
+3. Role-Based Access Control (RBAC) across endpoints (e.g., `customer`, `admin`).
+4. Secure token refresh rotation and denylist/revocation capabilities.
+
+Two primary architectural patterns were considered:
+1. **Decentralized Authentication**: Every microservice receives the raw JWT, verifies its signature independently, and queries the user database or identity provider as needed.
+2. **Centralized Edge Authentication with Internal Identity Propagation**: The API Gateway terminates client credentials/JWTs, cryptographically verifies the token, and propagates trusted identity claims downstream via standard internal HTTP/gRPC headers.
+
+---
+
+## Decision
+We adopt **Centralized Edge Authentication with Internal Identity Propagation**:
+
+### 1. Token Issuance and Refresh (User Service)
+* The **User Service** acts as the internal Identity Provider (IdP).
+* Users authenticate via credentials validated against salted, hashed passwords (Argon2id).
+* Upon login, the User Service issues:
+  * **Access Token**: Short-lived JWT (e.g., 15 minutes) signed with HMAC-SHA256 (or asymmetric RSA/ECDSA).
+  * **Refresh Token**: Long-lived, cryptographically secure random token (e.g., 7 days) stored as a secure hash in `users_db` to support single-session revocation and refresh token rotation.
+
+### 2. Ingress Token Termination (API Gateway)
+* The **API Gateway** intercepts all incoming requests to protected routes (`/api/v1/*`).
+* The Gateway validates the JWT signature, expiration, and issuer.
+* Tokens listed in a Redis revocation denylist (e.g., logged-out users) are rejected immediately (HTTP 401 Unauthorized).
+
+### 3. Downstream Identity Propagation
+* Once validated, the Gateway strips untrusted incoming client identity headers and injects verified internal headers:
+  * `X-User-Id`: The authenticated user's unique identifier (UUIDv4).
+  * `X-User-Email`: The user's primary email address.
+  * `X-User-Roles`: Comma-separated assigned roles (e.g., `customer,admin`).
+* For internal gRPC calls, these claims are propagated in gRPC request `Metadata`.
+* Downstream services (Order, Payment, Shipping) read these trusted headers directly, avoiding redundant database lookups or signature verifications.
+
+### 4. Zero Direct Ingress for Internal Services
+* Internal microservices are deployed inside a private network or container bridge with no external public routing. Only the API Gateway is exposed publicly.
+
+---
+
+## Assumptions
+* **Trusted Internal Network**: Downstream microservices operate within a private virtual network (Docker bridge in local dev; private VPC subnets / Kubernetes cluster network in production) where headers injected by the API Gateway cannot be spoofed by external actors.
+* **Stateless Token Verification**: Access token validation at the Gateway is predominantly cryptographic (CPU-bound) with Redis consulted only for explicit blacklists/revocations to maintain sub-millisecond response times.
+* **Role Hierarchy Simplicity**: Initial RBAC requirements are coarse-grained (`customer`, `admin`, `system`). Fine-grained policy engines (e.g., OPA) are deferred to later enterprise stages.
+
+---
+
+## Consequences
+
+### Positive
+* **High Performance**: Internal services avoid verifying cryptographic JWT signatures on every inter-service call, reducing latency and CPU overhead.
+* **Simplified Service Code**: Microservices do not need complex JWT middleware or shared secret keys; they extract user context using standard NestJS parameter decorators (`@CurrentUser()`).
+* **Instant Session Revocation**: Compromised tokens or user logout events can be blacklisted in Redis with a TTL matching the token's remaining lifetime.
+* **Centralized Security Auditing**: Token validation failures, rate limiting, and suspicious brute-force attempts are caught and logged at the perimeter before touching business services.
+
+### Negative / Trade-offs
+* **Perimeter Dependency**: Internal services inherently trust the `X-User-Id` and `X-User-Roles` headers. If an attacker manages to bypass the Gateway or compromise the internal network, they could forge identity headers.
+* **Clock Skew**: Discrepancies between servers could result in premature token expiration or delayed expiration if system clocks drift (mitigated by NTP synchronization and a short leeway window).
+
+### Mitigations
+* In production (Stage 6), internal communication will enforce Mutual TLS (mTLS) or a shared internal HMAC signature header generated by the Gateway (`X-ShopFlow-Internal-Signature`) to guarantee header authenticity.
+* All incoming client headers with prefixes `X-User-*` are stripped at the API Gateway before routing.
+
+---
+
+## Alternatives Considered
+* **Decentralized Verification across all services**: Rejected because sharing JWT secrets or public keys across 7 services couples token rotation logic and increases latency on inter-service hops.
+* **Opaque Session Tokens**: Rejected for external API calls because session lookups require a database/Redis hit on every single client query, whereas stateless JWTs enable immediate stateless routing at the edge.
